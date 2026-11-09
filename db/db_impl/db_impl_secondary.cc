@@ -737,7 +737,36 @@ Status DBImplSecondary::TryCatchUpWithPrimary() {
       }
     }
     if (s.ok()) {
-      for (auto cfd : cfds_changed) {
+      // Every column family, not only those changed in this round: one whose
+      // log number moved in a round that failed after the MANIFEST replay
+      // keeps its replayed memtable otherwise.
+      for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+        if (cfd->IsDropped() || !cfd->initialized()) {
+          continue;
+        }
+        bool changed = cfds_changed.count(cfd) > 0;
+        // The active memtable holds only entries replayed from WALs up to
+        // cfd_to_current_log_[cfd]. Once the primary has flushed past that
+        // WAL, the flushed files hold all of it and anything written after
+        // it, so keeping the memtable would shadow those newer values: seal
+        // it, stamped with the log number after its contents, so that
+        // RemoveOldMemTables below drops it.
+        auto it = cfd_to_current_log_.find(cfd);
+        if (!cfd->mem()->IsEmpty() && it != cfd_to_current_log_.end() &&
+            it->second < cfd->GetLogNumber()) {
+          MemTable* new_mem = cfd->ConstructNewMemtable(
+              cfd->GetLatestMutableCFOptions(), versions_->LastSequence());
+          cfd->mem()->SetNextLogNumber(it->second + 1);
+          cfd->mem()->ConstructFragmentedRangeTombstones();
+          cfd->imm()->Add(cfd->mem(), &job_context.memtables_to_free);
+          new_mem->Ref();
+          cfd->SetMemtable(new_mem);
+          cfd_to_current_log_.erase(it);
+          changed = true;
+        }
+        if (!changed) {
+          continue;
+        }
         cfd->imm()->RemoveOldMemTables(cfd->GetLogNumber(),
                                        &job_context.memtables_to_free);
         auto& sv_context = job_context.superversion_contexts.back();
